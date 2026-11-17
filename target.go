@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/chromedp/cdproto"
 	"github.com/chromedp/cdproto/cdp"
@@ -41,7 +42,7 @@ type Target struct {
 	exposed    map[string]struct{}
 	exposedSeq int
 
-	// frameMu protects frames, execContexts, and cur.
+	// frameMu protects frames, execContexts, cur, worldGen and worldFails.
 	frameMu sync.RWMutex
 	// frames is the set of encountered frames.
 	frames       map[cdp.FrameID]*Frame
@@ -51,6 +52,21 @@ type Target struct {
 	execUniqueIDs map[cdp.FrameID]string
 	// cur is the current top level frame.
 	cur cdp.FrameID
+	// worldGen counts the calls of dropWorlds. frameExecContext does not keep
+	// a world that it created before a drop.
+	worldGen uint64
+	// worldFails holds the last failed Page.createIsolatedWorld of each frame,
+	// so that the loops of the queries and of Poll do not send it every 5 ms.
+	worldFails map[cdp.FrameID]worldFailure
+
+	// noRuntimeEnable is true when the target did not get Runtime.enable. Then
+	// execContexts holds the isolated worlds that frameExecContext creates.
+	// attachTarget sets it before run starts.
+	noRuntimeEnable bool
+
+	// now returns the time for the retry of a failed isolated world. It is nil
+	// outside the tests, and then frameExecContext uses time.Now.
+	now func() time.Time
 
 	// logging funcs
 	logf, errf func(string, ...any)
@@ -82,14 +98,17 @@ func (t *Target) enclosingFrame(node *Node) cdp.FrameID {
 // ensureFrame makes sure that the top frame of this target is loaded. It
 // returns the top frame, the root node, and the ExecutionContextID of the top
 // frame. Otherwise it returns false as its last return value.
-func (t *Target) ensureFrame() (*Frame, *Node, runtime.ExecutionContextID, bool) {
+//
+// Without Runtime.enable, it can send Page.createIsolatedWorld. So it must not
+// run on the goroutines of Target.run.
+func (t *Target) ensureFrame(ctx context.Context) (*Frame, *Node, runtime.ExecutionContextID, bool) {
 	t.frameMu.RLock()
-	frame := t.frames[t.cur]
-	execCtx := t.execContexts[t.cur]
+	cur := t.cur
+	frame := t.frames[cur]
 	t.frameMu.RUnlock()
 
 	// the frame has not loaded yet.
-	if frame == nil || execCtx == 0 {
+	if frame == nil {
 		return nil, nil, 0, false
 	}
 
@@ -101,7 +120,119 @@ func (t *Target) ensureFrame() (*Frame, *Node, runtime.ExecutionContextID, bool)
 		// not root node yet?
 		return nil, nil, 0, false
 	}
+
+	execCtx, err := t.frameExecContext(ctx, cur)
+	if err != nil || execCtx == 0 {
+		return nil, nil, 0, false
+	}
 	return frame, root, execCtx, true
+}
+
+// isolatedWorldName is the name of the world that frameExecContext creates in
+// a frame.
+const isolatedWorldName = "__chromedp_query"
+
+// worldRetryInterval is the time for which frameExecContext returns the last
+// failed Page.createIsolatedWorld of a frame, before it sends the command
+// again for the same document.
+const worldRetryInterval = 200 * time.Millisecond
+
+// worldFailure is a failed Page.createIsolatedWorld. gen is the value of
+// worldGen when the command was sent, and at is the time of the failure.
+type worldFailure struct {
+	gen uint64
+	at  time.Time
+	err error
+}
+
+// frameExecContext returns the execution context of the frame with the id.
+//
+// With Runtime.enable, it is the context that the Runtime events reported, or
+// 0 when there is none. Without Runtime.enable, it is an isolated world of the
+// frame. frameExecContext creates the world on the first call and keeps it
+// until the frame navigates or detaches, or until the document is updated. The
+// page cannot see an isolated world, and the world shares the DOM with the
+// page. After a failure, frameExecContext returns the same error for
+// worldRetryInterval, or until dropWorlds runs.
+//
+// It sends a command, so it must not run on the goroutines of Target.run.
+func (t *Target) frameExecContext(ctx context.Context, id cdp.FrameID) (runtime.ExecutionContextID, error) {
+	t.frameMu.RLock()
+	execCtx := t.execContexts[id]
+	gen := t.worldGen
+	fail, failed := t.worldFails[id]
+	t.frameMu.RUnlock()
+	if execCtx != 0 || !t.noRuntimeEnable || id == "" {
+		return execCtx, nil
+	}
+	now := time.Now
+	if t.now != nil {
+		now = t.now
+	}
+	if failed && fail.gen == gen && now().Sub(fail.at) < worldRetryInterval {
+		return 0, fail.err
+	}
+	res, err := cdp.Call(ctx, t, page.CreateIsolatedWorld, page.CreateIsolatedWorldParams{
+		FrameID:   id,
+		WorldName: isolatedWorldName,
+	})
+	t.frameMu.Lock()
+	defer t.frameMu.Unlock()
+	if err != nil {
+		// The end of ctx says nothing about the frame, so do not keep the
+		// error. Do not keep it after a drop either.
+		if ctx.Err() == nil && t.worldGen == gen {
+			if t.worldFails == nil {
+				t.worldFails = make(map[cdp.FrameID]worldFailure)
+			}
+			t.worldFails[id] = worldFailure{gen: gen, at: now(), err: err}
+		}
+		return 0, err
+	}
+	delete(t.worldFails, id)
+	// When a drop came between the command and the reply, the world can belong
+	// to the old document. Use it for this call, but do not keep it.
+	if t.worldGen == gen {
+		t.execContexts[id] = res.ExecutionContextID
+	}
+	return res.ExecutionContextID, nil
+}
+
+// logWorldFailure logs the last failed Page.createIsolatedWorld of the top
+// frame, when the current document has one, and returns err. A query and Poll
+// call it when their context ends while they wait for the frame, so that the
+// reason of the wait is in the log. The action still returns the error of its
+// context.
+func (t *Target) logWorldFailure(err error) error {
+	t.frameMu.RLock()
+	cur := t.cur
+	fail, failed := t.worldFails[cur]
+	gen := t.worldGen
+	t.frameMu.RUnlock()
+	if failed && fail.gen == gen {
+		t.errf("could not create an isolated world in frame %s: %v (the wait ended with: %v)", cur, fail.err, err)
+	}
+	return err
+}
+
+// dropWorlds forgets the isolated world of the frame with the id, or of every
+// frame when the id is empty, and the failures of these frames. A new document
+// has none of the old worlds. With Runtime.enable, it does nothing, because
+// the Runtime events keep execContexts.
+func (t *Target) dropWorlds(id cdp.FrameID) {
+	if !t.noRuntimeEnable {
+		return
+	}
+	t.frameMu.Lock()
+	defer t.frameMu.Unlock()
+	if id == "" {
+		clear(t.execContexts)
+		clear(t.worldFails)
+	} else {
+		delete(t.execContexts, id)
+		delete(t.worldFails, id)
+	}
+	t.worldGen++
 }
 
 func (t *Target) run(ctx context.Context) {
@@ -357,6 +488,7 @@ func (t *Target) pageEvent(ev any) {
 
 	switch e := ev.(type) {
 	case *page.EventFrameNavigated:
+		t.dropWorlds(e.Frame.ID)
 		t.frameMu.Lock()
 		t.frames[e.Frame.ID] = &Frame{Frame: e.Frame}
 		if e.Frame.ParentID == "" {
@@ -371,6 +503,7 @@ func (t *Target) pageEvent(ev any) {
 		id, op = e.FrameID, frameAttached(e.ParentFrameID)
 
 	case *page.EventFrameDetached:
+		t.dropWorlds(e.FrameID)
 		id, op = e.FrameID, frameDetached
 
 	case *page.EventFrameStartedLoading:
@@ -433,6 +566,7 @@ func (t *Target) domEvent(ctx context.Context, ev any) {
 
 	switch e := ev.(type) {
 	case *dom.EventDocumentUpdated:
+		t.dropWorlds("")
 		t.documentUpdated(ctx)
 		return
 

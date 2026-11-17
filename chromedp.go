@@ -100,6 +100,10 @@ type Context struct {
 	// target before it sends a command to the target.
 	listeners []func(ev any)
 
+	// noRuntimeEnable is set by WithoutRuntimeEnable. attachTarget then does
+	// not send Runtime.enable to the target.
+	noRuntimeEnable bool
+
 	// browserOpts holds the browser options that NewContext receives from
 	// WithBrowserOption. Run uses them when it allocates a browser.
 	browserOpts []BrowserOption
@@ -578,18 +582,26 @@ func (c *Context) attachTarget(ctx context.Context, targetID target.ID) error {
 	for _, fn := range c.listeners {
 		t.listen(ctx, eventsOnly(fn))
 	}
+	// Set the field before run starts, because run reads it.
+	t.noRuntimeEnable = c.noRuntimeEnable
 	c.targetMu.Lock()
 	c.Target = t
 	c.targetMu.Unlock()
 
 	go c.Target.run(ctx)
 
+	// The Runtime events tell the target the execution context of each frame.
+	// Without them, the queries create an isolated world in each frame. See
+	// WithoutRuntimeEnable.
+	if !c.noRuntimeEnable {
+		if _, err := cdp.Call(ctx, c.Target, runtime.Enable, cdp.Empty{}); err != nil {
+			return err
+		}
+	}
 	// Find out whether this is a worker target. A worker cannot use
 	// Target.getTargetInfo or Target.getTargets, so find out whether "self"
 	// refers to a WorkerGlobalScope or a ServiceWorkerGlobalScope.
-	if _, err := cdp.Call(ctx, c.Target, runtime.Enable, cdp.Empty{}); err != nil {
-		return err
-	}
+	// Runtime.evaluate works without Runtime.enable.
 	self, err := cdp.Call(ctx, c.Target, runtime.Evaluate, runtime.EvaluateParams{Expression: "self"})
 	if err != nil {
 		return err
@@ -740,7 +752,7 @@ func WithTargetID(id target.ID) ContextOption {
 // for a new tab and for a target that [WithTargetID] names.
 //
 // So fn sees the events that the start causes. For example, the start sends
-// Runtime.enable, and Chrome answers with a [runtime.EventExecutionContextCreated]
+// Runtime.enable, unless the context has [WithoutRuntimeEnable], and Chrome answers with a [runtime.EventExecutionContextCreated]
 // for each JavaScript context that the target already has. A func that Listen
 // adds after the first Run does not see these events.
 //
@@ -754,6 +766,42 @@ func WithTargetID(id target.ID) ContextOption {
 // in the order of the options. A child context does not inherit them.
 func WithListener(fn func(ev any)) ContextOption {
 	return func(c *Context) { c.listeners = append(c.listeners, fn) }
+}
+
+// WithoutRuntimeEnable makes the context attach to its target without the
+// command Runtime.enable. By default, the first Run sends it.
+//
+// While the Runtime domain is enabled, Chrome serializes each argument of a
+// console call for the protocol. A page can see this work. For example, a
+// getter on the stack of an error that the page logs runs. So any page can
+// tell that a program drives it through the protocol. With this option, Chrome
+// does not do this work.
+//
+// Without Runtime.enable, Chrome sends no events of the Runtime domain to the
+// target. This has these effects:
+//
+//   - [Console] gets no console API calls and no uncaught exceptions. It still
+//     gets the entries of the browser log.
+//   - [Listen], [Events] and [WithListener] get no events of the Runtime
+//     domain, such as [runtime.EventConsoleAPICalled],
+//     [runtime.EventExceptionThrown] and
+//     [runtime.EventExecutionContextCreated].
+//   - Chrome does not add a binding of Runtime.addBinding to the page. So
+//     [ExposeFunc] returns no error, but the page gets no window.<name>.
+//
+// The queries and [Poll] need the execution context of a frame, which the
+// target otherwise learns from the Runtime events. With this option, the
+// target creates an isolated world in the frame with Page.createIsolatedWorld,
+// and keeps it until the frame navigates or detaches. An isolated world shares
+// the DOM with the page, but not its JavaScript globals. So the predicate of
+// [Poll] and [PollFunction] sees the DOM, and not the variables of the scripts
+// of the page. The same holds for the execution context that a func of
+// [WaitFunc] gets. [Evaluate] does not change, and runs in the main world of
+// the page.
+//
+// A child context does not inherit the option.
+func WithoutRuntimeEnable() ContextOption {
+	return func(c *Context) { c.noRuntimeEnable = true }
 }
 
 // CreateBrowserContextOption is an option for the creation of a BrowserContext.

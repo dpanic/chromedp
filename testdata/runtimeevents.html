@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <title>Runtime events</title>
+</head>
+<body>
+  <script>
+    console.log('hello console');
+  </script>
+  <script>
+    throw new Error('uncaught exception');
+  </script>
+  <script>
+    // The test adds the binding probeBinding before it loads the page.
+    var kind = typeof probeBinding;
+    if (kind === 'function') {
+      probeBinding('ping');
+    }
+    var done = document.createElement('p');
+    done.id = 'done';
+    done.textContent = kind;
+    document.body.appendChild(done);
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<head>
+  <title>page with an iframe and a global</title>
+</head>
+<body>
+  <p id="top">top doc</p>
+  <iframe id="frame" src="child1.html"></iframe>
+  <script>
+    // Only the main world of the page sees this global.
+    window.pageValue = 'main world';
+  </script>
+</body>
+</html>

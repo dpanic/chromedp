@@ -30,21 +30,23 @@ func runPoll[T any](ctx context.Context, t *Target, p *pollTask) (T, error) {
 	)
 
 	for {
-		_, _, execCtx, ok = t.ensureFrame()
+		_, _, execCtx, ok = t.ensureFrame(ctx)
 		if ok {
 			break
 		}
 		if err := sleepContext(ctx, 5*time.Millisecond); err != nil {
-			return zero, err
+			// Log why the frame had no execution context, if a failure is known.
+			return zero, t.logWorldFailure(err)
 		}
 	}
 
 	if p.frame != nil {
-		// enclosingFrame takes frameMu itself, so find the frame first.
-		frameID := t.enclosingFrame(p.frame)
-		t.frameMu.RLock()
-		execCtx = t.execContexts[frameID]
-		t.frameMu.RUnlock()
+		// Without Runtime.enable, frameExecContext creates the isolated world
+		// of the frame. It takes frameMu itself.
+		var err error
+		if execCtx, err = t.frameExecContext(ctx, t.enclosingFrame(p.frame)); err != nil {
+			return zero, err
+		}
 	}
 
 	args := make([]any, 0, len(p.args)+3)

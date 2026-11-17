@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <title>Runtime.enable probe</title>
+</head>
+<body>
+  <script>
+    // While the Runtime domain is enabled, Chrome serializes each console
+    // argument. The serialization formats the stack of an error, so
+    // Error.prepareStackTrace runs, and it reads the name of the error once
+    // more. Nothing else in the page reads these.
+    var detected = false;
+    var probe;
+    Error.prepareStackTrace = function (err, frames) {
+      if (err === probe) {
+        detected = true;
+      }
+      return String(err);
+    };
+    probe = new Error('probe');
+    console.debug(probe);
+    delete Error.prepareStackTrace;
+
+    var names = 0;
+    class ProbeError extends Error {
+      get name() {
+        names++;
+        return 'ProbeError';
+      }
+    }
+    console.debug(new ProbeError('probe'));
+    if (names > 1) {
+      detected = true;
+    }
+
+    var result = document.createElement('p');
+    result.id = 'result';
+    result.textContent = detected ? 'detected' : 'not detected';
+    document.body.appendChild(result);
+  </script>
+</body>
+</html>

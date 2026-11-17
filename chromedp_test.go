@@ -156,7 +156,9 @@ func into[T any](dst *T, a Action[T]) Action[Void] {
 
 var allocateOnce sync.Once
 
-func testAllocate(tb testing.TB, name string) (context.Context, context.CancelFunc) {
+// testAllocate opens a new tab with the options in the shared browser. When
+// name is not empty, it loads the HTML file of testdata with that name.
+func testAllocate(tb testing.TB, name string, opts ...ContextOption) (context.Context, context.CancelFunc) {
 	// Start the browser exactly once, as needed.
 	allocateOnce.Do(func() { browserCtx, _ = testAllocateSeparate(tb) })
 
@@ -167,7 +169,7 @@ func testAllocate(tb testing.TB, name string) (context.Context, context.CancelFu
 
 	// Same browser, new tab. We do not need to start a new chrome browser for
 	// each test, and this gives a huge speed-up.
-	ctx, _ := NewContext(browserCtx)
+	ctx, _ := NewContext(browserCtx, opts...)
 
 	// Navigate only if we want an HTML file name. Otherwise leave the blank page.
 	if name != "" {

@@ -256,8 +256,18 @@ func newSelector[S Selectable](sel S, opts []QueryOption) *Selector {
 // last funcs succeed, or when the context is canceled. The last func can be
 // nil.
 func (s *Selector) run(ctx context.Context, t *Target, last func(context.Context, []*Node) error) error {
+	err := s.retry(ctx, t, last)
+	if err != nil && ctx.Err() != nil {
+		// Log why the frame had no execution context, if a failure is known.
+		t.logWorldFailure(err)
+	}
+	return err
+}
+
+// retry is the loop of run.
+func (s *Selector) retry(ctx context.Context, t *Target, last func(context.Context, []*Node) error) error {
 	return retryWithSleep(ctx, s.retryInterval, func(ctx context.Context) (bool, error) {
-		frame, root, execCtx, ok := t.ensureFrame()
+		frame, root, execCtx, ok := t.ensureFrame(ctx)
 		if !ok {
 			return false, nil
 		}
@@ -267,9 +277,10 @@ func (s *Selector) run(ctx context.Context, t *Target, last func(context.Context
 			fromNode = root
 		} else {
 			frameID := t.enclosingFrame(fromNode)
-			t.frameMu.RLock()
-			execCtx = t.execContexts[frameID]
-			t.frameMu.RUnlock()
+			// Without Runtime.enable, this creates the isolated world of the
+			// nested frame. After an error, execCtx is 0, as for a frame
+			// with no known context.
+			execCtx, _ = t.frameExecContext(ctx, frameID)
 
 			// TODO: we probably want to use the nested frame
 			// instead. Note that util.go stores the nodes of the

@@ -895,6 +895,27 @@ if err := chromedp.Do(tabCtx); err != nil {
 
 The rules of `Listen` hold for the func. Give the option more than once to add several funcs. The [contexts](https://github.com/chromedp/examples/tree/main/contexts) example attaches to a tab with two iframes, and shows that a `Listen` call after the attach sees none of these events.
 
+### 31. Hide the Runtime domain from the page
+
+The first `Run` sends `Runtime.enable`. While the Runtime domain is enabled, Chrome serializes each argument of a console call, and a page can see this work. `WithoutRuntimeEnable` leaves out the command. The queries and `Poll` then run their checks in an isolated world of each frame. An isolated world shares the DOM with the page, but not its JavaScript globals. `Evaluate` still runs in the main world of the page.
+
+```go
+ctx, cancel := chromedp.NewContext(parent, chromedp.WithoutRuntimeEnable())
+defer cancel()
+
+if err := chromedp.Do(ctx, chromedp.Navigate(url)); err != nil {
+	log.Fatal(err)
+}
+// The query works as before.
+title, err := chromedp.Run(ctx, chromedp.Text(chromedp.CSS("h1")))
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(title)
+```
+
+With the option, Chrome sends no Runtime events. `Console` gets only the entries of the browser log, `Listen` gets no `runtime.EventConsoleAPICalled` and no `runtime.EventExceptionThrown`, and `ExposeFunc` returns no error, but the page gets no `window.<name>`. A `Poll` predicate that reads a global of the page script does not see it. Read the global with `Evaluate` instead.
+
 ## What the new API removes
 
 The new API removes the interface `Action`, the type `ActionFunc`, the type `Tasks`, and the funcs `ListenTarget` and `ListenBrowser`. `Listen` and `ListenBrowser` bring back the ordered listener, with one more result, an error, and see example 28. It also removes the types `QueryAction`, `NavigateAction`, `EvaluateAction`, `CallAction`, `PollAction`, `MouseAction`, `KeyAction` and `EmulateAction`. Each type is now `Action[T]`. It also removes the six lookup options that start with `By`, except `ByFunc`. A selector type replaces each of them. `docs/MIGRATION.md` lists every change, with the old name and the new name.
@@ -1086,6 +1107,7 @@ func WithNewBrowserContext(options ...CreateBrowserContextOption) ContextOption
 func WithNewWindow(newWindow bool) ContextOption
 func WithTargetID(id target.ID) ContextOption
 func WithVisibleWindow() ContextOption
+func WithoutRuntimeEnable() ContextOption
 
 type CreateBrowserContextOption = func(*target.CreateBrowserContextParams)
 
